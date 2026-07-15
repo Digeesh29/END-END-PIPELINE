@@ -169,7 +169,7 @@ Adds `year` and `month` columns and writes the cleaned data partitioned by both,
 ![Airflow DAG graph view](screenshot/dag_graph.png)
 
 ### MinIO bucket structure
-![MinIO console showing raw/clean buckets](screenshot/minIO.png)
+![MinIO console showing raw/clean buckets](screenshot/miniIO.png)
 
 ### Partition pruning proof (Spark query plan)
 ![Spark explain output showing PartitionFilters](screenshot/analytics.png)
