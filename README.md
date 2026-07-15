@@ -1,4 +1,4 @@
-<<<<<<< HEAD
+
 # NYC Taxi Batch Pipeline
 
 An end-to-end batch data pipeline that ingests raw NYC Taxi trip data, cleans and enriches it, validates data quality, and produces a partitioned analytics table — all orchestrated by Apache Airflow and running on Dockerized infrastructure with PySpark and MinIO (S3-compatible object storage).
