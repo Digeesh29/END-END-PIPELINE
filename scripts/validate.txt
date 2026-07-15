@@ -1,0 +1,107 @@
+"""
+validate.py
+Phase 4 - Data Quality Checks (manual, lightweight version)
+
+Reads the cleaned trip-level data from MinIO and runs a series of
+checks. If any check fails, the script exits with a non-zero code -
+this is what lets Airflow mark the task (and the whole DAG run) as
+FAILED, stopping any downstream steps from running on bad data.
+
+Checks performed (mirrors what Great Expectations would validate):
+1. No nulls in key columns
+2. Row count is within an expected range
+3. No pickup dates in the future
+"""
+
+import sys
+from datetime import date
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import col
+
+spark = SparkSession.builder \
+    .appName("validate") \
+    .master("local[2]") \
+    .config("spark.driver.memory", "1500m") \
+    .config("spark.sql.shuffle.partitions", "4") \
+    .config("spark.jars", "/opt/spark_jars/hadoop-aws-3.3.4.jar,/opt/spark_jars/aws-java-sdk-bundle-1.12.262.jar") \
+    .config("spark.hadoop.fs.s3a.endpoint", "http://minio:9000") \
+    .config("spark.hadoop.fs.s3a.access.key", "minioadmin") \
+    .config("spark.hadoop.fs.s3a.secret.key", "minioadmin") \
+    .config("spark.hadoop.fs.s3a.path.style.access", "true") \
+    .config("spark.hadoop.fs.s3a.impl", "org.apache.hadoop.fs.s3a.S3AFileSystem") \
+    .config("spark.hadoop.fs.s3a.connection.ssl.enabled", "false") \
+    .getOrCreate()
+
+spark.sparkContext.setLogLevel("WARN")
+
+CLEAN_PATH = "s3a://clean/taxi_trips/"
+df = spark.read.parquet(CLEAN_PATH)
+df = df.cache()   # we'll run several checks against this - cache so it's only computed once
+
+total_rows = df.count()
+print(f"Read {total_rows} rows from {CLEAN_PATH}")
+
+# Track every failure so we report ALL problems at once, not just the first one
+failures = []
+
+# --- Check 1: No nulls in key columns ---
+# These columns are essential - a null here means the row is unusable
+# downstream (can't compute revenue without total_amount, can't group
+# by date without pickup_date, etc.)
+KEY_COLUMNS = ["VendorID", "tpep_pickup_datetime", "PULocationID",
+               "DOLocationID", "total_amount", "pickup_date"]
+
+for column in KEY_COLUMNS:
+    null_count = df.filter(col(column).isNull()).count()
+    if null_count > 0:
+        failures.append(
+            f"NULL CHECK FAILED: '{column}' has {null_count} null value(s)"
+        )
+    else:
+        print(f"NULL CHECK PASSED: '{column}' has no nulls")
+
+# --- Check 2: Row count within expected range ---
+# Guards against a job silently processing an empty file (upstream bug)
+# or an unexpectedly huge file (duplicate ingestion, bad wildcard match).
+MIN_EXPECTED_ROWS = 100
+MAX_EXPECTED_ROWS = 1_000_000
+
+if total_rows < MIN_EXPECTED_ROWS:
+    failures.append(
+        f"ROW COUNT CHECK FAILED: {total_rows} rows is below minimum "
+        f"expected {MIN_EXPECTED_ROWS}"
+    )
+elif total_rows > MAX_EXPECTED_ROWS:
+    failures.append(
+        f"ROW COUNT CHECK FAILED: {total_rows} rows exceeds maximum "
+        f"expected {MAX_EXPECTED_ROWS}"
+    )
+else:
+    print(f"ROW COUNT CHECK PASSED: {total_rows} rows is within expected range")
+
+# --- Check 3: No future pickup dates ---
+# A pickup_date after today indicates bad/corrupted source data -
+# taxi trips can't happen in the future.
+today = date.today()
+future_rows = df.filter(col("pickup_date") > today).count()
+
+if future_rows > 0:
+    failures.append(
+        f"FUTURE DATE CHECK FAILED: {future_rows} row(s) have a "
+        f"pickup_date after {today}"
+    )
+else:
+    print(f"FUTURE DATE CHECK PASSED: no pickup_date after {today}")
+
+# --- Final verdict ---
+print("\n--- VALIDATION SUMMARY ---")
+if failures:
+    print(f"{len(failures)} check(s) FAILED:")
+    for f in failures:
+        print(f"  - {f}")
+    spark.stop()
+    sys.exit(1)   # non-zero exit code = Airflow marks this task as FAILED
+else:
+    print("All checks PASSED.")
+    spark.stop()
+    sys.exit(0)   # zero = success, Airflow marks this task as SUCCESS

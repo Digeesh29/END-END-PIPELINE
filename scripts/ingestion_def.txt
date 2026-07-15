@@ -1,0 +1,88 @@
+"""
+raw_ingest.py
+Phase 2 - Raw Ingestion Layer
+
+Reads raw NYC Taxi trip data files, adds audit/metadata columns,
+and writes them untouched (no cleaning, no filtering) to the
+'raw' zone in MinIO. This is the first stage of the medallion-style
+pipeline: raw -> clean -> analytics.
+"""
+
+# SparkSession is the entry point to using Spark - every PySpark script needs one.
+from pyspark.sql import SparkSession
+
+# Built-in Spark functions we need:
+# current_timestamp() -> generates the exact time the job runs
+# input_file_name()   -> gives the source filename each row came from
+# lit()               -> lets us insert a fixed/literal value into a column
+from pyspark.sql.functions import current_timestamp, input_file_name, lit
+
+# --- 1. Start the Spark session ---
+spark = SparkSession.builder \
+    .appName("raw_ingest") \
+    .master("local[*]") \
+    .config("spark.jars", "/opt/spark_jars/hadoop-aws-3.3.4.jar,/opt/spark_jars/aws-java-sdk-bundle-1.12.262.jar") \
+    .config("spark.hadoop.fs.s3a.endpoint", "http://minio:9000") \
+    .config("spark.hadoop.fs.s3a.access.key", "minioadmin") \
+    .config("spark.hadoop.fs.s3a.secret.key", "minioadmin") \
+    .config("spark.hadoop.fs.s3a.path.style.access", "true") \
+    .config("spark.hadoop.fs.s3a.impl", "org.apache.hadoop.fs.s3a.S3AFileSystem") \
+    .config("spark.hadoop.fs.s3a.connection.ssl.enabled", "false") \
+    .getOrCreate()
+# .appName(...)        -> just a label, shows up in Spark UI/logs
+# .master("local[*]")  -> run locally, use all available CPU cores as workers
+# .config(...) x7       -> same MinIO/S3 connection settings from Phase 1,
+#                          needed every time we read/write s3a:// paths
+
+# Reduce log noise - without this, Spark prints hundreds of INFO lines you don't need
+spark.sparkContext.setLogLevel("WARN")
+
+# --- 2. Read the raw trip data ---
+# NYC TLC now distributes trip data as Parquet files directly, so we read
+# every .parquet file in this folder at once using a wildcard (*).
+RAW_DATA_PATH = "/opt/airflow/scripts/data/*.parquet"
+
+df = spark.read.parquet(RAW_DATA_PATH)
+# spark.read.parquet(...) -> reads Parquet file(s) into a DataFrame.
+# Using a folder + wildcard means Spark reads ALL matching files as one
+# combined DataFrame - this is how you handle "2-3 months of files" at once.
+
+print(f"Read {df.count()} rows from {RAW_DATA_PATH}")
+# .count() forces Spark to actually scan the data and tells you row volume -
+# useful as a sanity check that files were found and read correctly.
+
+# --- 3. Add metadata / audit columns ---
+# This is the core purpose of the raw layer: never transform the data,
+# just tag it with WHEN it arrived and WHERE it came from.
+enriched_df = df \
+    .withColumn("ingestion_timestamp", current_timestamp()) \
+    .withColumn("source_file", input_file_name())
+# .withColumn(name, value) -> adds a new column without modifying existing ones
+# current_timestamp()      -> records the exact moment this job ran (audit trail)
+# input_file_name()        -> records which physical file each row came from -
+#                              critical for debugging bad data back to its source
+
+print("Schema after adding metadata columns:")
+enriched_df.printSchema()
+# .printSchema() shows column names + types - a quick way to confirm the
+# new columns were added correctly before writing anything out.
+
+# --- 4. Write to the raw zone in MinIO ---
+OUTPUT_PATH = "s3a://raw/taxi_trips/"
+
+enriched_df.write.mode("append").parquet(OUTPUT_PATH)
+# .write.mode("append") -> ADDS new data without deleting what's already there.
+#                          This matters for a raw zone: every ingestion run
+#                          should accumulate data, never overwrite history.
+#                          (Contrast with .mode("overwrite"), which we used
+#                          in the Phase 1 test script - fine for testing,
+#                          wrong for a real raw/audit layer.)
+# .parquet(OUTPUT_PATH)  -> writes the DataFrame as Parquet files to that
+#                          MinIO path.
+
+print(f"Wrote {enriched_df.count()} rows to {OUTPUT_PATH}")
+
+# --- 5. Clean up ---
+spark.stop()
+# Releases the Spark session's resources (memory, threads). Good practice
+# to always call this at the end of a script.

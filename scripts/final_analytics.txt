@@ -1,0 +1,77 @@
+"""
+final_analytics.py
+Phase 5 - Partitioned Final Analytics Table
+
+Reads the cleaned trip-level data, adds year/month columns, and
+writes it partitioned by year and month. Partitioning lets any
+downstream query that filters on year/month skip reading irrelevant
+files entirely (partition pruning) - this is what makes large-scale
+analytics queries fast.
+"""
+
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import col, year, month
+
+spark = SparkSession.builder \
+    .appName("final_analytics") \
+    .master("local[2]") \
+    .config("spark.driver.memory", "1500m") \
+    .config("spark.sql.shuffle.partitions", "4") \
+    .config("spark.jars", "/opt/spark_jars/hadoop-aws-3.3.4.jar,/opt/spark_jars/aws-java-sdk-bundle-1.12.262.jar") \
+    .config("spark.hadoop.fs.s3a.endpoint", "http://minio:9000") \
+    .config("spark.hadoop.fs.s3a.access.key", "minioadmin") \
+    .config("spark.hadoop.fs.s3a.secret.key", "minioadmin") \
+    .config("spark.hadoop.fs.s3a.path.style.access", "true") \
+    .config("spark.hadoop.fs.s3a.impl", "org.apache.hadoop.fs.s3a.S3AFileSystem") \
+    .config("spark.hadoop.fs.s3a.connection.ssl.enabled", "false") \
+    .getOrCreate()
+
+spark.sparkContext.setLogLevel("WARN")
+
+# --- 1. Read cleaned trip-level data ---
+CLEAN_PATH = "s3a://clean/taxi_trips/"
+df = spark.read.parquet(CLEAN_PATH)
+print(f"Read {df.count()} rows from {CLEAN_PATH}")
+
+# --- 2. Add year/month columns from pickup_date ---
+# year() and month() extract integer parts from a date column.
+# These become the actual partition columns - Spark uses their VALUES
+# to create folder names like year=2026/month=1/
+df = df.withColumn("year", year(col("pickup_date"))) \
+        .withColumn("month", month(col("pickup_date")))
+
+df.select("pickup_date", "year", "month").distinct().show()
+# Quick sanity check - shows which year/month combinations exist in
+# your sample before writing, so you know what partitions to expect.
+
+# --- 3. Write partitioned by year and month ---
+FINAL_PATH = "s3a://clean/taxi_analytics/"
+
+df.write.mode("overwrite").partitionBy("year", "month").parquet(FINAL_PATH)
+# .partitionBy("year", "month") is the key difference from a normal write.
+# Instead of one flat folder of files, Spark creates a folder PER
+# distinct year/month combination, e.g.:
+#   taxi_analytics/year=2025/month=12/part-....parquet
+#   taxi_analytics/year=2026/month=1/part-....parquet
+# When a query later filters WHERE year=2026 AND month=1, Spark can
+# skip reading the year=2025/month=12 folder entirely - this is
+# "partition pruning", and it's what makes partitioned tables fast
+# at scale even though it makes no visible difference on tiny data.
+
+print(f"Wrote partitioned analytics table to {FINAL_PATH}")
+
+# --- 4. Prove partition pruning works ---
+# Read back filtered to ONE partition and check the query plan.
+sample_query = spark.read.parquet(FINAL_PATH).filter(
+    (col("year") == 2026) & (col("month") == 1)
+)
+
+print("\n--- Query plan for year=2026, month=1 filter ---")
+sample_query.explain()
+# In the printed plan, look for "PartitionFilters" listing year/month
+# conditions - this confirms Spark is pruning at the file-listing level,
+# not just filtering rows after reading everything.
+
+print(f"Rows matching year=2026, month=1: {sample_query.count()}")
+
+spark.stop()

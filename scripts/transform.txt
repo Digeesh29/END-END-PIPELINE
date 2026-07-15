@@ -1,0 +1,144 @@
+"""
+transform.py
+Phase 3 - Transformation Layer
+
+Reads raw taxi trip data from the 'raw' zone in MinIO, cleans it,
+joins it with the taxi zone lookup table, computes aggregations,
+and writes the result to the 'clean' zone.
+
+Assumes standard NYC TLC Yellow Taxi columns:
+VendorID, tpep_pickup_datetime, tpep_dropoff_datetime, passenger_count,
+trip_distance, PULocationID, DOLocationID, fare_amount, tip_amount, total_amount
+
+And NYC_taxi_Zones.csv columns: LocationID, Borough, Zone, service_zone
+
+If your actual column names differ, check with df.printSchema() and
+adjust the column names below to match.
+"""
+
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import (
+    col, to_date, sum as spark_sum, count as spark_count,
+    avg as spark_avg
+)
+# col()        -> refers to an existing column by name (needed for filters/casts)
+# to_date()    -> extracts just the date part from a timestamp, for daily grouping
+# sum, count, avg -> aggregation functions, aliased so they don't clash with
+#                    Python's own built-in sum()/count() functions
+
+# --- 1. Start Spark session with MinIO config (same as raw_ingest.py) ---
+spark = SparkSession.builder \
+    .appName("transform") \
+    .master("local[*]") \
+    .config("spark.jars", "/opt/spark_jars/hadoop-aws-3.3.4.jar,/opt/spark_jars/aws-java-sdk-bundle-1.12.262.jar") \
+    .config("spark.hadoop.fs.s3a.endpoint", "http://minio:9000") \
+    .config("spark.hadoop.fs.s3a.access.key", "minioadmin") \
+    .config("spark.hadoop.fs.s3a.secret.key", "minioadmin") \
+    .config("spark.hadoop.fs.s3a.path.style.access", "true") \
+    .config("spark.hadoop.fs.s3a.impl", "org.apache.hadoop.fs.s3a.S3AFileSystem") \
+    .config("spark.hadoop.fs.s3a.connection.ssl.enabled", "false") \
+    .getOrCreate()
+
+spark.sparkContext.setLogLevel("WARN")
+
+# --- 2. Read raw trip data from MinIO ---
+RAW_PATH = "s3a://raw/taxi_trips/"
+trips = spark.read.parquet(RAW_PATH)
+# Reads everything written by raw_ingest.py, including the
+# ingestion_timestamp / source_file columns we added earlier.
+
+print(f"Read {trips.count()} raw rows from {RAW_PATH}")
+
+# --- 3. Deduplicate ---
+# Raw zone can contain exact duplicate rows if raw_ingest.py was run more
+# than once on overlapping data (remember it uses .mode("append")).
+trips = trips.dropDuplicates([
+    "VendorID", "tpep_pickup_datetime", "tpep_dropoff_datetime",
+    "PULocationID", "DOLocationID", "total_amount"
+])
+# dropDuplicates(subset) -> removes rows that match on ALL listed columns.
+# We list several columns (not just one id) because raw taxi data usually
+# has no single unique trip_id - this combination approximates one.
+
+print(f"{trips.count()} rows remain after deduplication")
+
+# --- 4. Cast types and filter obviously bad rows ---
+trips = trips \
+    .withColumn("trip_distance", col("trip_distance").cast("double")) \
+    .withColumn("fare_amount", col("fare_amount").cast("double")) \
+    .withColumn("total_amount", col("total_amount").cast("double")) \
+    .withColumn("pickup_date", to_date(col("tpep_pickup_datetime")))
+# Casting ensures these columns are numeric even if they arrived as strings.
+# to_date() creates a clean "pickup_date" column (just the date, no time) -
+# this is what we'll group by for daily aggregations later.
+
+trips = trips.filter(
+    (col("trip_distance") > 0) &
+    (col("fare_amount") > 0) &
+    (col("total_amount") > 0)
+)
+# Basic sanity filter: negative or zero distance/fare rows are almost
+# always data errors (refunds, cancelled trips, bad meter readings).
+# NOTE: in a real pipeline you'd send these to a quarantine table instead
+# of silently dropping them - flagging this as a good "Phase 4" addition
+# once Great Expectations is in place.
+
+print(f"{trips.count()} rows remain after type casting and filtering")
+
+# --- 5. Join with the zone lookup table ---
+ZONES_PATH = "/opt/airflow/scripts/NYC_taxi_Zones.csv"
+zones = spark.read.option("header", True).csv(ZONES_PATH)
+# Small reference table - Borough/Zone names per LocationID. Reading it
+# from local disk since it's a static lookup file, not raw event data.
+
+zones_pickup = zones.selectExpr(
+    "LocationID as PULocationID",
+    "Zone as pickup_zone",
+    "Borough as pickup_borough"
+)
+zones_dropoff = zones.selectExpr(
+    "LocationID as DOLocationID",
+    "Zone as dropoff_zone",
+    "Borough as dropoff_borough"
+)
+# We alias the same lookup table twice with different column names,
+# because we need to join it TWICE - once for pickup location,
+# once for dropoff location. Without aliasing, Spark can't tell the
+# two joins apart (both would try to join on "LocationID").
+
+trips = trips \
+    .join(zones_pickup, on="PULocationID", how="left") \
+    .join(zones_dropoff, on="DOLocationID", how="left")
+# how="left" -> keep all trip rows even if a LocationID has no match in
+# the zones table (better than silently dropping trips over a bad join key)
+
+# --- 6. Compute daily aggregations ---
+daily_summary = trips.groupBy("pickup_date", "pickup_borough").agg(
+    spark_sum("total_amount").alias("daily_revenue"),
+    spark_count("*").alias("trip_count"),
+    spark_avg("trip_distance").alias("avg_trip_distance")
+)
+# groupBy(...).agg(...) -> the core aggregation pattern in Spark.
+# One row per (date, borough) combination, with revenue/trip
+# count/avg distance rolled up - this is the "rolling averages,
+# daily totals" step from the project guide.
+
+print("Sample of daily summary:")
+daily_summary.show(10)
+
+# --- 7. Write clean data to MinIO ---
+CLEAN_PATH = "s3a://clean/taxi_daily_summary/"
+daily_summary.write.mode("overwrite").parquet(CLEAN_PATH)
+# .mode("overwrite") is appropriate HERE (unlike raw_ingest.py) because
+# this is a derived/aggregated table - each run should represent the
+# full current picture, not accumulate duplicate summaries.
+
+print(f"Wrote daily summary to {CLEAN_PATH}")
+
+# Also write the full cleaned (row-level) trips, not just the aggregate -
+# useful for any downstream job that needs trip-level detail, not summaries.
+CLEAN_TRIPS_PATH = "s3a://clean/taxi_trips/"
+trips.write.mode("overwrite").parquet(CLEAN_TRIPS_PATH)
+print(f"Wrote cleaned trip-level data to {CLEAN_TRIPS_PATH}")
+
+spark.stop()
